@@ -2,6 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
+import numpy as np
+from loguru import logger
+
+import sys
+logger.remove()
+logger.add(sys.stderr, level="INFO")  # Only show INFO
 
 
 class cLN(nn.Module):
@@ -279,8 +285,11 @@ class MCTasNet(nn.Module):
         )
         
         # TCN separator
-        self.TCN = TCN(self.enc_dim+180, self.enc_dim*self.num_spk, self.feature_dim, self.feature_dim*4,
-                              self.layer, self.stack, self.kernel, causal=self.causal)
+        tcn_input_dim = enc_dim + (30 if in_ch == 2 else 180)
+        self.TCN = TCN(tcn_input_dim, enc_dim*num_spk, feature_dim, feature_dim*4,
+                      layer, stack, kernel, causal=causal)
+        # self.TCN = TCN(self.enc_dim+180, self.enc_dim*self.num_spk, self.feature_dim, self.feature_dim*4,
+        #                       self.layer, self.stack, self.kernel, causal=self.causal)
 
         self.receptive_field = self.TCN.receptive_field
         
@@ -296,6 +305,13 @@ class MCTasNet(nn.Module):
         
         if input.dim() == 2:
             input = input.unsqueeze(1)
+        
+        # Ensure input has self.in_ch channels by repeating if needed
+        # Expand single-channel input to multi-channel input
+        # torch.Size([2, 1, 32000]) ==> torch.Size([2, 6, 32000])
+        if input.size(1) == 1 and self.in_ch > 1:
+            input = input.repeat(1, self.in_ch, 1)
+        
         batch_size = input.size(0)
         nsample = input.size(2)
         rest = self.win - (self.stride + nsample % self.win) % self.win
@@ -320,18 +336,42 @@ class MCTasNet(nn.Module):
 
         #2d spatial conv
         s_in = output.unsqueeze(1)
-        pair1 = torch.cat((s_in[:, :, 3, :].unsqueeze(2),s_in[:, :, 0, :].unsqueeze(2)),dim=2)
-        pair2 = torch.cat((s_in[:, :, 1, :].unsqueeze(2),s_in[:, :, 4, :].unsqueeze(2)),dim=2)
-        pair3 = torch.cat((s_in[:, :, 2, :].unsqueeze(2),s_in[:, :, 5, :].unsqueeze(2)),dim=2)
-        pair4 = torch.cat((s_in[:, :, 0, :].unsqueeze(2),s_in[:, :, 1, :].unsqueeze(2)),dim=2)
-        pair5 = torch.cat((s_in[:, :, 2, :].unsqueeze(2),s_in[:, :, 3, :].unsqueeze(2)),dim=2)
-        pair6 = torch.cat((s_in[:, :, 4, :].unsqueeze(2),s_in[:, :, 5, :].unsqueeze(2)),dim=2)
-        spa_out = torch.cat((self.conv(pair1), self.conv(pair2), self.conv(pair3), self.conv(pair4), self.conv(pair5), self.conv(pair6)), dim=1) # B, 180, N, L
+        logger.debug(s_in.shape)
+        logger.debug(self.in_ch)
+        if self.in_ch == 6:
+            pair1 = torch.cat((s_in[:, :, 3, :].unsqueeze(2),s_in[:, :, 0, :].unsqueeze(2)),dim=2)
+            pair2 = torch.cat((s_in[:, :, 1, :].unsqueeze(2),s_in[:, :, 4, :].unsqueeze(2)),dim=2)
+            pair3 = torch.cat((s_in[:, :, 2, :].unsqueeze(2),s_in[:, :, 5, :].unsqueeze(2)),dim=2)
+            pair4 = torch.cat((s_in[:, :, 0, :].unsqueeze(2),s_in[:, :, 1, :].unsqueeze(2)),dim=2)
+            pair5 = torch.cat((s_in[:, :, 2, :].unsqueeze(2),s_in[:, :, 3, :].unsqueeze(2)),dim=2)
+            pair6 = torch.cat((s_in[:, :, 4, :].unsqueeze(2),s_in[:, :, 5, :].unsqueeze(2)),dim=2)
+            spa_out = torch.cat(
+                (
+                    self.conv(pair1),
+                    self.conv(pair2),
+                    self.conv(pair3),
+                    self.conv(pair4),
+                    self.conv(pair5),
+                    self.conv(pair6)
+                ),
+                dim=1
+            )
+        elif self.in_ch == 2:
+            pair1 = torch.cat((s_in[:, :, 0, :].unsqueeze(2), s_in[:, :, 1, :].unsqueeze(2)), dim=2)
+            spa_out = self.conv(pair1)  # B, 30, N, L
+        else:
+            raise NotImplementedError
+        
         B, C, N, L = spa_out.shape
         spa_out = spa_out.view(B, C * N, L)
-        
 
-        spa_spec = self.TCN(torch.cat((enc_output, spa_out), dim=1)).view(batch_size, self.num_spk, self.enc_dim, -1) # B, E+C*N, L
+        logger.debug(spa_out.shape)
+        logger.debug(enc_output.shape)
+        _spa_spec = torch.cat((enc_output, spa_out), dim=1)
+        logger.debug(_spa_spec.shape)
+
+        spa_spec = self.TCN(_spa_spec)
+        spa_spec = spa_spec.view(batch_size, self.num_spk, self.enc_dim, -1) # B, E+C*N, L
                                    
         # generate masks
         masks = torch.sigmoid(spa_spec).view(batch_size, self.num_spk, self.enc_dim, -1)  # B, C, N, L
@@ -345,12 +385,24 @@ class MCTasNet(nn.Module):
         return output
 
 def test_conv_tasnet():
-    x = torch.rand(2, 32000)
-    nnet = MCTasNet()
+    x = torch.rand(BATCH_SIZE, NUM_CHANNELS, SEQ_LENGTH) # B C T
+    nnet = MCTasNet(in_ch=NUM_CHANNELS)
     x = nnet(x)
-    s1 = x[0]
-    print(s1.shape)
+    logger.info(x.shape)
+    # torch.Size([16, 1, 16000])
 
+def test_model_complexity_info():
+    from ptflops import get_model_complexity_info
+    nnet = MCTasNet(in_ch=2)
+    flops, params = get_model_complexity_info(nnet,
+                                              (SINGLE_CHANNEL, AUDIO_SAMPLE_RATE),
+                                              as_strings=True,
+                                              print_per_layer_stat=False)
+    logger.info(f'flops:{flops}, params:{params}')
+    # flops:10.22 GMac, params:5.0 M
 
 if __name__ == "__main__":
+    BATCH_SIZE, NUM_CHANNELS, SEQ_LENGTH = 16, 2, 16000
+    SINGLE_CHANNEL, AUDIO_SAMPLE_RATE = 1, 16000
     test_conv_tasnet()
+    test_model_complexity_info()
